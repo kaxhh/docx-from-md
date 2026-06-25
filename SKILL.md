@@ -12,10 +12,10 @@ description: Convert a Markdown document to DOCX using pre-generated md_to_json.
 本 skill 的 `scripts/` 目录必须包含以下文件（由 `docx-deterministic-generator` skill 生成后放入）：
 
 - `scripts/fix_md_tables.py` — 表格预处理（修复非矩形管道表格）
-- `scripts/md_to_json.py` — MD → JSON 转换器
+- `scripts/md_to_json.py` — MD → JSON 转换器（内嵌 JSON schema）
 - `scripts/render_docx.py` — JSON → DOCX 渲染器
 
-如果这两个文件不存在，提示用户：
+如果 `md_to_json.py` 或 `render_docx.py` 不存在，提示用户：
 
 > 请先使用 `$docx-deterministic-generator` 分析你的 `.docx` 模板，生成 `md_to_json.py` 和 `render_docx.py`，然后将它们复制到 `skills/docx-from-md/scripts/` 目录。
 
@@ -31,8 +31,6 @@ description: Convert a Markdown document to DOCX using pre-generated md_to_json.
 python3 skills/docx-from-md/scripts/run_pipeline.py \
   --md 你的文档.md \
   --template 模板.docx \
-  --schema out/docx-template-analysis/content_contract.schema.json \
-  --table-catalog out/docx-template-analysis/table_catalog.json \
   --output generated.docx
 ```
 
@@ -42,8 +40,6 @@ python3 skills/docx-from-md/scripts/run_pipeline.py \
 |---|---|---|
 | `--md` | ✅ | 输入的 Markdown 文档（按模板章节格式编写） |
 | `--template` | ✅ | 原始 `.docx` 模板 |
-| `--schema` | ✅ | `content_contract.schema.json` 路径 |
-| `--table-catalog` | ✅ | `table_catalog.json` 路径 |
 | `--output` | ✅ | 输出 `.docx` 路径 |
 | `--keep-json` | ❌ | 保留中间 JSON 文件（默认删除） |
 

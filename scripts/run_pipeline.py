@@ -50,8 +50,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--md", required=True, type=Path, help="输入的 Markdown 文档")
     parser.add_argument("--template", required=True, type=Path, help=".docx 模板文件")
-    parser.add_argument("--schema", required=True, type=Path, help="content_contract.schema.json 路径")
-    parser.add_argument("--table-catalog", required=True, type=Path, help="table_catalog.json 路径")
     parser.add_argument("--output", required=True, type=Path, help="输出 .docx 路径")
     parser.add_argument("--keep-json", action="store_true", help="保留中间 JSON 文件")
     args = parser.parse_args()
@@ -59,8 +57,6 @@ def main() -> None:
     for path, label in [
         (args.md, "Markdown 文件"),
         (args.template, ".docx 模板"),
-        (args.schema, "JSON schema"),
-        (args.table_catalog, "table_catalog.json"),
     ]:
         if not path.exists():
             print(f"错误：{label}不存在：{path}", file=sys.stderr)
@@ -97,7 +93,6 @@ def main() -> None:
             [
                 sys.executable, str(MD_TO_JSON),
                 "--input", str(fixed_md_path),
-                "--schema", str(args.schema),
                 "--output", str(json_path),
             ],
         )
@@ -108,7 +103,6 @@ def main() -> None:
                 sys.executable, str(RENDER_DOCX),
                 "--template", str(args.template),
                 "--input", str(json_path),
-                "--table-catalog", str(args.table_catalog),
                 "--output", str(args.output),
             ],
         )

@@ -1,670 +1,690 @@
 #!/usr/bin/env python3
 """
-render_docx.py — JSON → DOCX renderer for the detailed design spec template.
+render_docx.py — JSON to DOCX renderer for AI+工业操作系统详细设计规格说明书
 
-Template: AI+工业操作系统研发项目详细设计规格说明书.docx
-Input:    content_data.json (produced by md_to_json.py)
+Template-specific renderer that clones the template shell and generates content.
 
-Uses python-docx to clone the template's page setup, headers, footers,
-styles, and numbering, then appends generated content. Tables are rendered
-with one function per table type. Formatting (fonts, shading, borders,
-cell margins, row heights) is derived from the template's table_catalog.json
-so it stays in sync when the template changes.
+Fidelity mode: Hybrid
+- Cover page, headers, footers, styles: cloned from template
+- Simple tables: built with python-docx, matching template formatting
+- Interface spec tables: explicit vMerge/gridSpan with correct cell removal
+- Paragraphs and headings: python-docx with template heading styles
+
+All formatting constants (column widths, header text, cell shading, borders)
+are derived from the template analysis and hardcoded in this script.
+When the template changes, regenerate this script.
 
 Usage:
-    python3 render_docx.py \
-        --template template.docx \
-        --input content_data.json \
-        --table-catalog analysis/table_catalog.json \
-        --output generated.docx
-
-Limitations:
-    - Cover page and TOC from the template are preserved; generated content
-      is appended after the existing body. The template's sample content
-      (chapter 4 "示例" etc.) is not auto-removed — either strip it from
-      the template beforehand or accept that the output contains both.
-    - Figures are rendered as Word picture placeholders referencing the
-      source path; actual image file embedding is supported only for PNG/JPG
-      files present on disk. EMF / OLE / Visio objects are not embedded —
-      the figure placeholder shows the caption and source path.
-    - Flowchart markers (<!-- FLOWCHART: name -->) are rendered as
-      "[流程图: name]" text placeholders.
+    python3 render_docx.py \\
+      --template template.docx \\
+      --input data.json \\
+      --output generated.docx
 """
 
 import argparse
 import copy
 import json
+import os
 import re
+import shutil
 import sys
-from pathlib import Path
-from xml.etree import ElementTree as ET
+import tempfile
+import zipfile
 
-try:
-    from docx import Document
-    from docx.shared import Pt, Cm, Twips, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-except ImportError as e:
-    sys.exit(f"python-docx is required: {e}")
+from lxml import etree
 
-# ---------------------------------------------------------------------------
-# Template-derived formatting constants.
-#
-# These are read from table_catalog.json at runtime, so the renderer
-# stays correct if the template's widths or headers change.
-# ---------------------------------------------------------------------------
-
-WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-# Style IDs used by the template (verified by inspection).
-HEADING_STYLE_IDS = {1: "2", 2: "3", 3: "4", 4: "5", 5: "6"}
-TABLE_CELL_STYLE_ID = "94"  # "表格内文字"
-CAPTION_STYLE_ID = "14"  # "Caption"
-CODE_STYLE_ID = "147"  # "代码"
-BODY_STYLE_ID = None  # None = Normal
-
-# Default header fill color (catalog shows D7D7D7 for simple tables and
-# D9D9D9 for interface_spec_table — we use D9D9D9 as the common fallback,
-# but the actual value is read from the catalog if available).
-DEFAULT_HEADER_FILL = "D9D9D9"
-
-# Flowchart marker regex.
-FLOWCHART_RE = re.compile(r"^\s*<!--\s*FLOWCHART:\s*(.+?)\s*-->\s*$")
+from docx import Document
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml
+from docx.shared import Pt, Twips, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
 
 
-# ---------------------------------------------------------------------------
-# Catalog loader.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Template Formatting Constants (from analysis)
+# ============================================================================
+
+CELL_STYLE_ID = '94'  # 表格内文字
+CELL_STYLE_NAME = '表格内文字'
+CAPTION_STYLE_ID = '14'  # caption
+CAPTION_STYLE_NAME = 'caption'
+HEADER_FILL = 'D9D9D9'
+BORDER_SZ = '4'
+BORDER_VAL = 'single'
+BORDER_COLOR = 'auto'
+CELL_MARGIN_TOP = '0'
+CELL_MARGIN_LEFT = '108'
+CELL_MARGIN_BOTTOM = '0'
+CELL_MARGIN_RIGHT = '108'
+
+# Heading style IDs from template: H1=2, H2=3, H3=4, H4=5, H5=6
+HEADING_STYLE_MAP = {1: '2', 2: '3', 3: '4', 4: '5', 5: '6'}
+
+# Table column widths (DXA, derived from template analysis)
+TABLE_WIDTHS = {
+    'macro_definition_table': [2305, 1736, 4341],
+    'struct_member_table': [2683, 1991, 3818],
+    'global_variable_table': [5270, 1674, 1548],
+    'interface_spec_table': [1378, 1984, 1276, 4068],
+}
+
+TABLE_HEADERS = {
+    'macro_definition_table': ['宏名称', '宏内容', '说明'],
+    'struct_member_table': ['成员变量', '类型', '说明'],
+    'global_variable_table': ['全局变量名称', '类型', '说明'],
+}
+
+# Interface spec table row labels
+INTERFACE_ROW_LABELS = {
+    'prototype': '接口原型',
+    'description': '接口描述',
+    'parameters': '接口参数',
+    'returns': '返回值',
+    'constraints': '使用限制',
+    'notes': '其它说明',
+}
 
 
-def load_catalog(catalog_path):
-    """Load table_catalog.json and extract per-family metadata."""
-    if not catalog_path:
-        return {}
-    data = json.loads(Path(catalog_path).read_text(encoding="utf-8"))
-    families = {}
-    for fam in data.get("summary", []):
-        ttype = fam["type"]
-        # Find the matching table in the full tables array.
-        ex = fam["examples"][0]
-        full_table = next(
-            (t for t in data.get("tables", []) if t["id"] == ex["id"]), {}
-        )
-        header_labels = full_table.get("header") or [
-            cell["text"] for cell in full_table.get("rows", [{}])[0].get("cells", [])
-        ]
-        families[ttype] = {
-            "col_widths": fam["canonical_columns"],
-            "header_labels": header_labels,
-            "has_merges": ex.get("has_merges", False),
-        }
-    # Read header fill from the first body cell with shading.
-    header_fill = DEFAULT_HEADER_FILL
-    for t in data.get("tables", []):
-        for row in t.get("rows", []):
-            for cell in row.get("cells", []):
-                shd = cell.get("shading")
-                if shd and shd != "auto":
-                    header_fill = shd
-                    break
-            if header_fill != DEFAULT_HEADER_FILL:
-                break
-        if header_fill != DEFAULT_HEADER_FILL:
-            break
-    families["_header_fill"] = header_fill
-    return families
+# ============================================================================
+# XML Helper Functions
+# ============================================================================
+
+W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
 
-# ---------------------------------------------------------------------------
-# Table rendering — one function per table type.
-# ---------------------------------------------------------------------------
+def _get_style(doc, style_name, style_id=None):
+    """Get a style by name with optional fallback to ID."""
+    try:
+        return doc.styles[style_name]
+    except KeyError:
+        if style_id:
+            try:
+                return doc.styles.get_by_id(style_id, 'paragraph')
+            except:
+                pass
+        return None
 
 
-def _set_cell_shading(cell, fill_hex):
-    tc_pr = cell._tc.get_or_add_tcPr()
-    shd = tc_pr.find(qn("w:shd"))
-    if shd is None:
-        shd = OxmlElement("w:shd")
-        tc_pr.append(shd)
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), fill_hex)
+def _make_tc_pr(width_dxa, shading=None, grid_span=1, v_merge=None,
+                border_sz=BORDER_SZ):
+    """Create a <w:tcPr> element."""
+    tc_pr = etree.SubElement(etree.Element('dummy'), qn('w:tcPr'))
 
+    # Width
+    tc_w = etree.SubElement(tc_pr, qn('w:tcW'))
+    tc_w.set(qn('w:w'), str(width_dxa))
+    tc_w.set(qn('w:type'), 'dxa')
 
-def _set_cell_border_width(cell, sz="4"):
-    """Ensure the cell has explicit borders with the given sz."""
-    tc_pr = cell._tc.get_or_add_tcPr()
-    borders = tc_pr.find(qn("w:tcBorders"))
-    if borders is None:
-        borders = OxmlElement("w:tcBorders")
-        tc_pr.append(borders)
-    for side in ("top", "left", "bottom", "right"):
-        elem = borders.find(qn(f"w:{side}"))
-        if elem is None:
-            elem = OxmlElement(f"w:{side}")
-            borders.append(elem)
-        elem.set(qn("w:val"), "single")
-        elem.set(qn("w:color"), "auto")
-        elem.set(qn("w:sz"), sz)
-        elem.set(qn("w:space"), "0")
+    # Borders
+    borders = etree.SubElement(tc_pr, qn('w:tcBorders'))
+    for side in ('top', 'left', 'bottom', 'right'):
+        b = etree.SubElement(borders, qn(f'w:{side}'))
+        b.set(qn('w:val'), BORDER_VAL)
+        b.set(qn('w:color'), BORDER_COLOR)
+        b.set(qn('w:sz'), border_sz)
+        b.set(qn('w:space'), '0')
 
+    # Shading
+    shd = etree.SubElement(tc_pr, qn('w:shd'))
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), shading if shading else 'auto')
 
-def _set_cell_width(cell, dxa):
-    tc_pr = cell._tc.get_or_add_tcPr()
-    tcW = tc_pr.find(qn("w:tcW"))
-    if tcW is None:
-        tcW = OxmlElement("w:tcW")
-        tc_pr.append(tcW)
-    tcW.set(qn("w:w"), str(dxa))
-    tcW.set(qn("w:type"), "dxa")
+    # Grid span
+    if grid_span > 1:
+        gs = etree.SubElement(tc_pr, qn('w:gridSpan'))
+        gs.set(qn('w:val'), str(grid_span))
 
+    # Vertical merge
+    if v_merge == 'restart':
+        vm = etree.SubElement(tc_pr, qn('w:vMerge'))
+        vm.set(qn('w:val'), 'restart')
+    elif v_merge == 'continue':
+        vm = etree.SubElement(tc_pr, qn('w:vMerge'))
 
-def _set_cell_vertical_align(cell, align="center"):
-    tc_pr = cell._tc.get_or_add_tcPr()
-    vAlign = tc_pr.find(qn("w:vAlign"))
-    if vAlign is None:
-        vAlign = OxmlElement("w:vAlign")
-        tc_pr.append(vAlign)
-    vAlign.set(qn("w:val"), align)
+    # Vertical align
+    va = etree.SubElement(tc_pr, qn('w:vAlign'))
+    va.set(qn('w:val'), 'center')
 
-
-def _set_grid_span(cell, span):
-    if span <= 1:
-        return
-    tc_pr = cell._tc.get_or_add_tcPr()
-    gs = tc_pr.find(qn("w:gridSpan"))
-    if gs is None:
-        gs = OxmlElement("w:gridSpan")
-        tc_pr.append(gs)
-    gs.set(qn("w:val"), str(span))
-
-
-def _set_v_merge(cell, val):
-    """Set vMerge on a cell. val is 'restart' or 'continue'."""
-    tc_pr = cell._tc.get_or_add_tcPr()
-    vm = tc_pr.find(qn("w:vMerge"))
-    if vm is None:
-        vm = OxmlElement("w:vMerge")
-        tc_pr.append(vm)
-    if val == "restart":
-        vm.set(qn("w:val"), "restart")
-    # 'continue' is represented by an empty w:vMerge element (no w:val).
+    return tc_pr
 
 
 def _remove_grid_span_cells(row, current_idx, span):
-    """Remove the (span - 1) physical cells right after the current one.
-
-    python-docx creates all physical cells upfront. Setting w:gridSpan makes
-    one cell span multiple grid columns, but the covered <w:tc> elements
-    still exist and create redundant empty cells.
-
-    row.cells is a cached @property — after the first XML removal its
-    indices are stale. Collect all elements to remove in one pass, then
-    remove them.
-    """
+    """Remove (span-1) physical cells right after the current cell."""
     if span <= 1:
         return
-    tcs = list(row._tr.iterchildren(qn("w:tc")))
-    to_remove = tcs[current_idx + 1 : current_idx + span]
+    tcs = list(row._tr.iterchildren(qn('w:tc')))
+    to_remove = tcs[current_idx + 1: current_idx + span]
     for tc in to_remove:
         row._tr.remove(tc)
 
 
-def _set_table_grid(table, col_widths):
-    """Replace the table's <w:tblGrid> with the given column widths."""
+def _set_cell_style(cell, style_name=CELL_STYLE_NAME):
+    """Set paragraph style for all paragraphs in a cell."""
+    style = _get_style(cell.part.document, style_name)
+    if style:
+        for para in cell.paragraphs:
+            para.style = style
+
+
+def _set_cell_text(cell, text, style_name=CELL_STYLE_NAME, is_header=False):
+    """Set cell text with proper paragraph style."""
+    # Get style by name
+    style = _get_style(cell.part.document, style_name)
+
+    # Clear existing content
+    for para in cell.paragraphs:
+        for run in para.runs:
+            run.text = ''
+
+    # Handle multiline text
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if i == 0:
+            para = cell.paragraphs[0]
+            para.text = ''
+            run = para.add_run(line)
+        else:
+            para = cell.add_paragraph()
+            run = para.add_run(line)
+        if style:
+            para.style = style
+
+
+def _add_table_to_doc(doc, n_rows, n_cols, col_widths):
+    """Add a table with correct grid columns."""
+    table = doc.add_table(rows=n_rows, cols=n_cols)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    # Set tblGrid
     tbl = table._tbl
-    tblGrid = tbl.find(qn("w:tblGrid"))
-    if tblGrid is not None:
-        tbl.remove(tblGrid)
-    tblGrid = OxmlElement("w:tblGrid")
+    tbl_grid = tbl.find(qn('w:tblGrid'))
+    if tbl_grid is None:
+        tbl_grid = etree.SubElement(tbl, qn('w:tblGrid'))
+    else:
+        for gc in tbl_grid.findall(qn('w:gridCol')):
+            tbl_grid.remove(gc)
+
     for w in col_widths:
-        gc = OxmlElement("w:gridCol")
-        gc.set(qn("w:w"), str(w))
-        tblGrid.append(gc)
-    # Insert after tblPr.
-    tblPr = tbl.find(qn("w:tblPr"))
-    tblPr.addnext(tblGrid)
+        gc = etree.SubElement(tbl_grid, qn('w:gridCol'))
+        gc.set(qn('w:w'), str(w))
+
+    # Set tblPr
+    tbl_pr = tbl.find(qn('w:tblPr'))
+    if tbl_pr is not None:
+        # Cell margins
+        cell_mar = tbl_pr.find(qn('w:tblCellMar'))
+        if cell_mar is None:
+            cell_mar = etree.SubElement(tbl_pr, qn('w:tblCellMar'))
+        for side, val in [('top', CELL_MARGIN_TOP), ('left', CELL_MARGIN_LEFT),
+                          ('bottom', CELL_MARGIN_BOTTOM), ('right', CELL_MARGIN_RIGHT)]:
+            m = cell_mar.find(qn(f'w:{side}'))
+            if m is None:
+                m = etree.SubElement(cell_mar, qn(f'w:{side}'))
+            m.set(qn('w:w'), val)
+            m.set(qn('w:type'), 'dxa')
+
+    return table
 
 
-def _set_table_borders(table, sz="4"):
-    """Apply uniform single borders of the given sz to the table."""
-    tbl = table._tbl
-    tblPr = tbl.find(qn("w:tblPr"))
-    borders = tblPr.find(qn("w:tblBorders"))
-    if borders is None:
-        borders = OxmlElement("w:tblBorders")
-        tblPr.append(borders)
-    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        elem = borders.find(qn(f"w:{side}"))
-        if elem is None:
-            elem = OxmlElement(f"w:{side}")
-            borders.append(elem)
-        elem.set(qn("w:val"), "single")
-        elem.set(qn("w:color"), "auto")
-        elem.set(qn("w:sz"), sz)
-        elem.set(qn("w:space"), "0")
+# ============================================================================
+# Simple Table Renderers
+# ============================================================================
+
+def render_simple_table(doc, table_data, table_type):
+    """Render a simple (non-merged) table."""
+    col_widths = TABLE_WIDTHS[table_type]
+    headers = TABLE_HEADERS[table_type]
+
+    # Get column keys from data
+    if table_type == 'macro_definition_table':
+        keys = ['name', 'value', 'description']
+    elif table_type == 'struct_member_table':
+        keys = ['name', 'type', 'description']
+    elif table_type == 'global_variable_table':
+        keys = ['name', 'type', 'description']
+    else:
+        keys = ['name', 'type', 'description']
+
+    rows = table_data.get('rows', [])
+    n_rows = 1 + len(rows)  # header + data
+
+    table = _add_table_to_doc(doc, n_rows, len(col_widths), col_widths)
+
+    # Header row
+    for j, (header_text, width) in enumerate(zip(headers, col_widths)):
+        cell = table.rows[0].cells[j]
+        _set_cell_text(cell, header_text, is_header=True)
+        # Apply header shading via tcPr
+        tc = cell._tc
+        tc_pr = tc.find(qn('w:tcPr'))
+        if tc_pr is None:
+            tc_pr = etree.Element(qn('w:tcPr'))
+            tc.insert(0, tc_pr)
+        shd = tc_pr.find(qn('w:shd'))
+        if shd is None:
+            shd = etree.SubElement(tc_pr, qn('w:shd'))
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), HEADER_FILL)
+
+    # Data rows
+    for i, row_data in enumerate(rows):
+        for j, key in enumerate(keys):
+            cell = table.rows[i + 1].cells[j]
+            text = row_data.get(key, '') if isinstance(row_data, dict) else str(row_data)
+            _set_cell_text(cell, text)
+
+    return table
 
 
-def _set_table_cell_margins(table, left=108, right=108, top=0, bottom=0):
-    tbl = table._tbl
-    tblPr = tbl.find(qn("w:tblPr"))
-    cm = tblPr.find(qn("w:tblCellMar"))
-    if cm is None:
-        cm = OxmlElement("w:tblCellMar")
-        tblPr.append(cm)
-    for name, val in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
-        elem = cm.find(qn(f"w:{name}"))
-        if elem is None:
-            elem = OxmlElement(f"w:{name}")
-            cm.append(elem)
-        elem.set(qn("w:w"), str(val))
-        elem.set(qn("w:type"), "dxa")
+# ============================================================================
+# Interface Spec Table Renderer
+# ============================================================================
 
-
-def _set_table_layout_fixed(table):
-    tbl = table._tbl
-    tblPr = tbl.find(qn("w:tblPr"))
-    layout = tblPr.find(qn("w:tblLayout"))
-    if layout is None:
-        layout = OxmlElement("w:tblLayout")
-        tblPr.append(layout)
-    layout.set(qn("w:type"), "fixed")
-
-
-def _write_cell_text(cell, text, style_id):
-    """Replace cell text, splitting newlines into multiple paragraphs.
-
-    Applies the given paragraph style to every paragraph in the cell.
-    """
-    lines = (text or "").split("\n")
-    if not lines:
-        lines = [""]
-    # python-docx cells always start with one empty paragraph.
-    # Reuse it for the first line, add new paragraphs for subsequent lines.
-    first_p = cell.paragraphs[0]
-    if style_id:
-        first_p.style = style_id
-    first_p.text = lines[0]
-    for line in lines[1:]:
-        p = cell.add_paragraph()
-        if style_id:
-            p.style = style_id
-        p.text = line
-
-
-def render_simple_table(doc, table_data, family_meta, header_fill):
-    """Render macro_definition_table / struct_member_table / global_variable_table."""
-    col_widths = family_meta["col_widths"]
-    header_labels = family_meta["header_labels"]
-    rows = table_data.get("rows", [])
-
-    table = doc.add_table(rows=1 + len(rows), cols=len(col_widths))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _set_table_grid(table, col_widths)
-    _set_table_borders(table, sz="4")
-    _set_table_cell_margins(table)
-    _set_table_layout_fixed(table)
-
-    # Header row.
-    hdr = table.rows[0]
-    for i, label in enumerate(header_labels):
-        cell = hdr.cells[i]
-        _set_cell_width(cell, col_widths[i])
-        _set_cell_shading(cell, header_fill)
-        _set_cell_vertical_align(cell, "center")
-        _set_cell_border_width(cell, "4")
-        _write_cell_text(cell, label, TABLE_CELL_STYLE_ID)
-
-    # Body rows — column keys come from the JSON row dicts (which are
-    # produced by md_to_json.py in the same order as header_labels).
-    keys = list(rows[0].keys()) if rows else []
-    for r_idx, row in enumerate(rows):
-        tr = table.rows[r_idx + 1]
-        for c_idx in range(len(col_widths)):
-            cell = tr.cells[c_idx]
-            _set_cell_width(cell, col_widths[c_idx])
-            _set_cell_shading(cell, "auto")
-            _set_cell_vertical_align(cell, "center")
-            _set_cell_border_width(cell, "4")
-            key = keys[c_idx] if c_idx < len(keys) else None
-            text = row.get(key, "") if key else ""
-            _write_cell_text(cell, text, TABLE_CELL_STYLE_ID)
-
-
-def render_interface_spec_table(doc, table_data, family_meta, header_fill):
-    """Render interface_spec_table with vMerge label groups."""
-    col_widths = family_meta["col_widths"]  # [1378, 1984, 1276, 4068]
+def render_interface_spec_table(doc, table_data):
+    """Render an interface_spec_table with vMerge and gridSpan."""
+    col_widths = TABLE_WIDTHS['interface_spec_table']
     total_width = sum(col_widths)
-    spec = table_data.get("rows", {})
-    if not isinstance(spec, dict):
-        raise SystemExit(
-            f"ERROR: interface_spec_table rows must be an object, got {type(spec).__name__}"
-        )
+    rows_data = table_data.get('rows', {})
 
-    # Build row plan: each entry is (cells, merge_info).
-    # cells: list of (text, gridSpan, is_header).
-    # merge_info: None | ("param_header", n) | "param_data"
-    #           | ("return_header", n) | "return_data".
+    # Build row plan: list of (cells_text, span_info, v_merge_info)
     row_plan = []
-    row_plan.append(
-        (
-            [("接口原型", 1, True), (spec.get("prototype", ""), 3, False)],
-            None,
-        )
-    )
-    row_plan.append(
-        (
-            [("接口描述", 1, True), (spec.get("description", ""), 3, False)],
-            None,
-        )
-    )
 
-    # Parameters group.
-    params = spec.get("parameters", [])
-    if isinstance(params, str):
-        # Scalar "无。" case.
-        row_plan.append(
-            ([("接口参数", 1, True), (params, 3, False)], None)
-        )
-    elif params:
-        n = len(params)
-        row_plan.append(
-            (
-                [
-                    ("接口参数", 1, True),
-                    ("数据类型", 1, True),
-                    ("参数名称", 1, True),
-                    ("参数说明", 1, True),
-                ],
-                ("param_header", n),
-            )
-        )
+    # Row 0: 接口原型 (label + content spanning 3 cols)
+    row_plan.append({
+        'cells': [
+            {'text': INTERFACE_ROW_LABELS['prototype'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+            {'text': rows_data.get('prototype', ''), 'span': 3, 'shading': None, 'vmerge': None},
+        ]
+    })
+
+    # Row 1: 接口描述 (label + content spanning 3 cols)
+    row_plan.append({
+        'cells': [
+            {'text': INTERFACE_ROW_LABELS['description'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+            {'text': rows_data.get('description', ''), 'span': 3, 'shading': None, 'vmerge': None},
+        ]
+    })
+
+    # Parameters section
+    params = rows_data.get('parameters', [])
+    if params:
+        # Label row (vmerge restart) + sub-header
+        row_plan.append({
+            'cells': [
+                {'text': INTERFACE_ROW_LABELS['parameters'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': 'restart'},
+                {'text': '数据类型', 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+                {'text': '参数名称', 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+                {'text': '参数说明', 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+            ]
+        })
         for p in params:
-            row_plan.append(
-                (
-                    [
-                        ("", 1, True),
-                        (p.get("type", ""), 1, False),
-                        (p.get("name", ""), 1, False),
-                        (p.get("desc", ""), 1, False),
-                    ],
-                    "param_data",
-                )
-            )
+            row_plan.append({
+                'cells': [
+                    {'text': '', 'span': 1, 'shading': None, 'vmerge': 'continue'},
+                    {'text': p.get('type', ''), 'span': 1, 'shading': None, 'vmerge': None},
+                    {'text': p.get('name', ''), 'span': 1, 'shading': None, 'vmerge': None},
+                    {'text': p.get('description', ''), 'span': 1, 'shading': None, 'vmerge': None},
+                ]
+            })
     else:
-        row_plan.append(
-            ([("接口参数", 1, True), ("无。", 3, False)], None)
-        )
+        row_plan.append({
+            'cells': [
+                {'text': INTERFACE_ROW_LABELS['parameters'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+                {'text': '无', 'span': 3, 'shading': None, 'vmerge': None},
+            ]
+        })
 
-    # Returns group.
-    returns = spec.get("returns", [])
-    if isinstance(returns, str):
-        row_plan.append(
-            ([("返回值", 1, True), (returns, 3, False)], None)
-        )
-    elif returns:
-        n = len(returns)
-        row_plan.append(
-            (
-                [
-                    ("返回值", 1, True),
-                    ("数据类型", 1, True),
-                    ("返回值说明", 2, True),
-                ],
-                ("return_header", n),
-            )
-        )
+    # Returns section
+    returns = rows_data.get('returns', [])
+    if returns:
+        row_plan.append({
+            'cells': [
+                {'text': INTERFACE_ROW_LABELS['returns'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': 'restart'},
+                {'text': '数据类型', 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+                {'text': '返回值说明', 'span': 2, 'shading': HEADER_FILL, 'vmerge': None},
+            ]
+        })
         for r in returns:
-            row_plan.append(
-                (
-                    [
-                        ("", 1, True),
-                        (r.get("type", ""), 1, False),
-                        (r.get("desc", ""), 2, False),
-                    ],
-                    "return_data",
-                )
-            )
+            row_plan.append({
+                'cells': [
+                    {'text': '', 'span': 1, 'shading': None, 'vmerge': 'continue'},
+                    {'text': r.get('type', ''), 'span': 1, 'shading': None, 'vmerge': None},
+                    {'text': r.get('description', ''), 'span': 2, 'shading': None, 'vmerge': None},
+                ]
+            })
     else:
-        row_plan.append(
-            ([("返回值", 1, True), ("无。", 3, False)], None)
-        )
+        row_plan.append({
+            'cells': [
+                {'text': INTERFACE_ROW_LABELS['returns'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+                {'text': '无', 'span': 3, 'shading': None, 'vmerge': None},
+            ]
+        })
 
-    # Constraints and notes.
-    row_plan.append(
-        ([("使用限制", 1, True), (spec.get("constraints", ""), 3, False)], None)
-    )
-    row_plan.append(
-        ([("其它说明", 1, True), (spec.get("notes", ""), 3, False)], None)
-    )
+    # Constraints
+    row_plan.append({
+        'cells': [
+            {'text': INTERFACE_ROW_LABELS['constraints'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+            {'text': rows_data.get('constraints', '无'), 'span': 3, 'shading': None, 'vmerge': None},
+        ]
+    })
 
-    table = doc.add_table(rows=len(row_plan), cols=len(col_widths))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _set_table_grid(table, col_widths)
-    _set_table_borders(table, sz="4")
-    _set_table_cell_margins(table)
-    _set_table_layout_fixed(table)
+    # Notes
+    row_plan.append({
+        'cells': [
+            {'text': INTERFACE_ROW_LABELS['notes'], 'span': 1, 'shading': HEADER_FILL, 'vmerge': None},
+            {'text': rows_data.get('notes', '无'), 'span': 3, 'shading': None, 'vmerge': None},
+        ]
+    })
 
-    # Walk row_plan and build cells. We need vMerge for multi-row groups.
-    # The first row of each group gets vMerge=restart; subsequent rows
-    # get vMerge=continue on the label cell.
-    group_cursor = None  # (label_row_idx, group_size) for active vMerge
+    n_rows = len(row_plan)
+    n_cols = 4  # grid columns
+    table = _add_table_to_doc(doc, n_rows, n_cols, col_widths)
 
-    for r_idx, (cells, meta) in enumerate(row_plan):
+    # Render each row
+    for r_idx, row_info in enumerate(row_plan):
         tr = table.rows[r_idx]
-        c_idx = 0
         physical_col = 0
         grid_col = 0
 
-        # vMerge tracking: is this row a group start, continuation, or standalone?
-        is_group_header = isinstance(meta, tuple) and meta[0] in (
-            "param_header",
-            "return_header",
-        )
-        is_group_data = meta in ("param_data", "return_data")
+        for cell_info in row_info['cells']:
+            span = cell_info['span']
+            vmerge = cell_info['vmerge']
+            shading = cell_info['shading']
+            text = cell_info['text']
 
-        if is_group_header:
-            group_cursor = (r_idx, meta[1])
-        elif is_group_data:
-            pass  # handled below
-        else:
-            group_cursor = None
-
-        for cell_text, span, is_header in cells:
             cell = tr.cells[physical_col]
-            # Compute cell width as sum of spanned grid columns.
-            span_width = sum(
-                col_widths[grid_col + s]
-                for s in range(span)
-                if grid_col + s < len(col_widths)
-            )
-            _set_cell_width(cell, span_width)
-            _set_grid_span(cell, span)
-            if is_header:
-                _set_cell_shading(cell, header_fill)
-                _set_cell_vertical_align(cell, "center")
-            else:
-                _set_cell_shading(cell, "auto")
-            _set_cell_border_width(cell, "4")
-            _write_cell_text(cell, cell_text, TABLE_CELL_STYLE_ID)
-            # Remove the (span-1) redundant physical cells after this one,
-            # then advance physical index by 1 and grid index by span.
+
+            # Calculate width for this cell
+            span_width = sum(col_widths[grid_col + s] for s in range(span))
+
+            # Set cell properties
+            tc = cell._tc
+            tc_pr = tc.find(qn('w:tcPr'))
+            if tc_pr is None:
+                tc_pr = etree.Element(qn('w:tcPr'))
+                tc.insert(0, tc_pr)
+
+            # Width
+            tc_w = tc_pr.find(qn('w:tcW'))
+            if tc_w is None:
+                tc_w = etree.SubElement(tc_pr, qn('w:tcW'))
+            tc_w.set(qn('w:w'), str(span_width))
+            tc_w.set(qn('w:type'), 'dxa')
+
+            # Borders
+            borders = tc_pr.find(qn('w:tcBorders'))
+            if borders is None:
+                borders = etree.SubElement(tc_pr, qn('w:tcBorders'))
+            for side in ('top', 'left', 'bottom', 'right'):
+                b = borders.find(qn(f'w:{side}'))
+                if b is None:
+                    b = etree.SubElement(borders, qn(f'w:{side}'))
+                b.set(qn('w:val'), BORDER_VAL)
+                b.set(qn('w:color'), BORDER_COLOR)
+                b.set(qn('w:sz'), BORDER_SZ)
+                b.set(qn('w:space'), '0')
+
+            # Shading
+            shd = tc_pr.find(qn('w:shd'))
+            if shd is None:
+                shd = etree.SubElement(tc_pr, qn('w:shd'))
+            shd.set(qn('w:val'), 'clear')
+            shd.set(qn('w:color'), 'auto')
+            shd.set(qn('w:fill'), shading if shading else 'auto')
+
+            # Grid span
+            if span > 1:
+                gs = tc_pr.find(qn('w:gridSpan'))
+                if gs is None:
+                    gs = etree.SubElement(tc_pr, qn('w:gridSpan'))
+                gs.set(qn('w:val'), str(span))
+
+            # Vertical merge
+            vm = tc_pr.find(qn('w:vMerge'))
+            if vmerge == 'restart':
+                if vm is None:
+                    vm = etree.SubElement(tc_pr, qn('w:vMerge'))
+                vm.set(qn('w:val'), 'restart')
+            elif vmerge == 'continue':
+                if vm is None:
+                    vm = etree.SubElement(tc_pr, qn('w:vMerge'))
+                # No val attribute for continue
+                if qn('w:val') in vm.attrib:
+                    del vm.attrib[qn('w:val')]
+
+            # Vertical align
+            va = tc_pr.find(qn('w:vAlign'))
+            if va is None:
+                va = etree.SubElement(tc_pr, qn('w:vAlign'))
+            va.set(qn('w:val'), 'center')
+
+            # Set text
+            _set_cell_text(cell, text)
+
+            # Remove covered cells for gridSpan
             _remove_grid_span_cells(tr, physical_col, span)
+
             physical_col += 1
             grid_col += span
 
-        # Apply vMerge to the label cell (column 0) if part of a group.
-        if is_group_header:
-            _set_v_merge(tr.cells[0], "restart")
-        elif is_group_data:
-            _set_v_merge(tr.cells[0], "continue")
+    return table
 
 
-# Map table type to renderer.
-TABLE_RENDERERS = {
-    "macro_definition_table": render_simple_table,
-    "struct_member_table": render_simple_table,
-    "global_variable_table": render_simple_table,
-    "interface_spec_table": render_interface_spec_table,
-}
+# ============================================================================
+# Document Renderer
+# ============================================================================
 
+class DocumentRenderer:
+    """Render JSON content into a DOCX file."""
 
-# ---------------------------------------------------------------------------
-# Content rendering.
-# ---------------------------------------------------------------------------
+    def __init__(self, template_path):
+        self.doc = Document(template_path)
 
+        # Remove all existing content from template body
+        body = self.doc.element.body
+        for child in list(body):
+            if child.tag != qn('w:sectPr'):
+                body.remove(child)
 
-def render_paragraph(doc, block):
-    btype = block.get("type", "paragraph")
-    text = block.get("text", "")
+    def render(self, data, output_path):
+        """Render the complete document."""
+        # Render cover page info
+        self._render_cover(data.get('document', {}))
 
-    if btype == "caption":
-        p = doc.add_paragraph()
-        p.style = CAPTION_STYLE_ID
-        p.text = text
-        return
+        # Render sections
+        for section in data.get('sections', []):
+            self._render_section(section)
 
-    # Flowchart placeholder from <!-- FLOWCHART: name -->.
-    m = FLOWCHART_RE.match(text)
-    if m:
-        p = doc.add_paragraph()
-        p.style = BODY_STYLE_ID
-        run = p.add_run(f"[流程图: {m.group(1)}]")
-        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-        return
+        self.doc.save(output_path)
 
-    p = doc.add_paragraph()
-    if BODY_STYLE_ID:
-        p.style = BODY_STYLE_ID
-    p.text = text
+    def _render_cover(self, doc_info):
+        """Render cover page fields."""
+        # Material ID
+        if doc_info.get('material_id'):
+            p = self.doc.add_paragraph(f"材料编号：{doc_info['material_id']}")
 
+        self.doc.add_paragraph('')
+        self.doc.add_paragraph('')
 
-def render_code_block(doc, cb):
-    caption = cb.get("caption")
-    if caption:
-        p = doc.add_paragraph()
-        p.style = CAPTION_STYLE_ID
-        p.text = caption
-    # Render code lines as consecutive paragraphs with the code style.
-    code = cb.get("code", "")
-    for line in code.split("\n"):
-        p = doc.add_paragraph()
-        p.style = CODE_STYLE_ID
-        p.text = line
+        # Title
+        if doc_info.get('title'):
+            p = self.doc.add_paragraph(doc_info['title'])
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.size = Pt(22)
+                run.font.bold = True
 
+        # Subtitle
+        if doc_info.get('subtitle'):
+            p = self.doc.add_paragraph(doc_info['subtitle'])
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.size = Pt(18)
 
-def render_figure(doc, fig):
-    source = fig.get("source", "")
-    caption = fig.get("caption", "")
+        self.doc.add_paragraph('')
+        self.doc.add_paragraph('')
 
-    # Image insertion: only for files we can actually read.
-    source_path = Path(source)
-    if source_path.exists() and source_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp"):
+        # Task info fields
+        for field, label in [('task_name', '任务名称'), ('task_number', '任务编号'),
+                             ('organization', '任务承担单位'), ('task_period', '任务起止时间')]:
+            if doc_info.get(field):
+                self.doc.add_paragraph(f'{label}：{doc_info[field]}')
+            else:
+                self.doc.add_paragraph(f'{label}：')
+
+        self.doc.add_paragraph('')
+        self.doc.add_paragraph('')
+
+        if doc_info.get('date'):
+            p = self.doc.add_paragraph(doc_info['date'])
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Page break after cover
+        self.doc.add_page_break()
+
+    def _render_section(self, section):
+        """Render a section (heading + content + children)."""
+        level = section.get('level', 1)
+        title = section.get('title', '')
+
+        # Add heading
         try:
-            doc.add_picture(str(source_path), width=Cm(14))
-        except Exception as e:
-            p = doc.add_paragraph()
-            p.text = f"[图: {source}] ({e})"
-    else:
-        # Placeholder for EMF / OLE / missing files.
-        p = doc.add_paragraph()
-        p.style = BODY_STYLE_ID
-        run = p.add_run(f"[图: {source}]")
-        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-
-    if caption:
-        p = doc.add_paragraph()
-        p.style = CAPTION_STYLE_ID
-        p.text = caption
-
-
-def render_table(doc, table_data, catalog, header_fill):
-    ttype = table_data["type"]
-    renderer = TABLE_RENDERERS.get(ttype)
-    if renderer is None:
-        raise SystemExit(f"ERROR: No renderer for table type {ttype!r}")
-    family_meta = catalog.get(ttype)
-    if family_meta is None:
-        raise SystemExit(f"ERROR: Table type {ttype!r} not in catalog")
-    caption = table_data.get("caption")
-    if caption:
-        # Table caption already emitted as a caption block in paragraphs
-        # by the converter — do NOT render it again here. The converter
-        # places caption blocks before the table in document order.
-        pass
-    renderer(doc, table_data, family_meta, header_fill)
-
-
-def render_section(doc, section, catalog, header_fill):
-    level = section.get("level", 1)
-    title = section.get("title", "")
-
-    # Heading.
-    style_id = HEADING_STYLE_IDS.get(level)
-    if style_id:
-        p = doc.add_heading(title, level=level)
-        # python-docx add_heading sets the heading style; override style_id
-        # if the template uses non-standard IDs.
-        try:
-            p.style = style_id
+            heading = self.doc.add_heading(title, level=level)
         except Exception:
-            pass
-    else:
-        p = doc.add_paragraph()
-        p.text = title
+            heading = self.doc.add_paragraph(title)
+            style_name = f'heading {level}'
+            style = _get_style(self.doc, style_name)
+            if style:
+                heading.style = style
 
-    # Paragraphs.
-    for block in section.get("paragraphs", []):
-        render_paragraph(doc, block)
+        # Render paragraphs
+        for para_data in section.get('paragraphs', []):
+            self._render_paragraph(para_data)
 
-    # Code blocks.
-    for cb in section.get("code_blocks", []):
-        render_code_block(doc, cb)
+        # Render tables
+        for table_data in section.get('tables', []):
+            self._render_table(table_data)
 
-    # Figures.
-    for fig in section.get("figures", []):
-        render_figure(doc, fig)
+        # Render code blocks
+        for code_data in section.get('code_blocks', []):
+            self._render_code_block(code_data)
 
-    # Tables — caption already in paragraphs, render body only.
-    for tbl in section.get("tables", []):
-        render_table(doc, tbl, catalog, header_fill)
+        # Render figures
+        for fig_data in section.get('figures', []):
+            self._render_figure(fig_data)
 
-    # Recurse into children.
-    for child in section.get("children", []):
-        render_section(doc, child, catalog, header_fill)
+        # Render children
+        for child in section.get('children', []):
+            self._render_section(child)
+
+    def _render_paragraph(self, para_data):
+        """Render a paragraph."""
+        para_type = para_data.get('type', 'body')
+        text = para_data.get('text', '')
+
+        if para_type == 'page_break':
+            self.doc.add_page_break()
+            return
+
+        if para_type == 'caption':
+            style = _get_style(self.doc, CAPTION_STYLE_NAME, CAPTION_STYLE_ID)
+            if style:
+                p = self.doc.add_paragraph(text, style=style)
+            else:
+                p = self.doc.add_paragraph(text)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.bold = True
+            return
+
+        p = self.doc.add_paragraph(text)
+
+    def _render_table(self, table_data):
+        """Render a table based on its type."""
+        table_type = table_data.get('type')
+
+        # Render caption if present
+        caption = table_data.get('caption')
+        if caption:
+            style = _get_style(self.doc, CAPTION_STYLE_NAME, CAPTION_STYLE_ID)
+            if style:
+                p = self.doc.add_paragraph(caption, style=style)
+            else:
+                p = self.doc.add_paragraph(caption)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.bold = True
+
+        if table_type == 'interface_spec_table':
+            render_interface_spec_table(self.doc, table_data)
+        elif table_type in ('macro_definition_table', 'struct_member_table',
+                           'global_variable_table'):
+            render_simple_table(self.doc, table_data, table_type)
+        else:
+            print(f'Warning: unknown table type "{table_type}", skipping',
+                  file=sys.stderr)
+
+    def _render_code_block(self, code_data):
+        """Render a code block."""
+        caption = code_data.get('caption')
+        if caption:
+            style = _get_style(self.doc, CAPTION_STYLE_NAME, CAPTION_STYLE_ID)
+            if style:
+                p = self.doc.add_paragraph(caption, style=style)
+            else:
+                p = self.doc.add_paragraph(caption)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        code = code_data.get('code', '')
+        p = self.doc.add_paragraph()
+        run = p.add_run(code)
+        run.font.name = 'Courier New'
+        run.font.size = Pt(9)
+
+    def _render_figure(self, fig_data):
+        """Render a figure placeholder."""
+        source = fig_data.get('source', '')
+        caption = fig_data.get('caption', '')
+
+        # Figure placeholder
+        p = self.doc.add_paragraph(f'[Figure: {source}]')
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Caption after figure
+        if caption:
+            style = _get_style(self.doc, CAPTION_STYLE_NAME, CAPTION_STYLE_ID)
+            if style:
+                p = self.doc.add_paragraph(caption, style=style)
+            else:
+                p = self.doc.add_paragraph(caption)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.bold = True
 
 
-# ---------------------------------------------------------------------------
-# Main.
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--template", required=True, help="Template DOCX file")
-    ap.add_argument("--input", required=True, help="Content JSON file")
-    ap.add_argument("--table-catalog", required=True, help="table_catalog.json")
-    ap.add_argument("--output", required=True, help="Output DOCX file")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(
+        description='Render JSON content to DOCX using template formatting')
+    parser.add_argument('--template', '-t', required=True, help='Template DOCX file')
+    parser.add_argument('--input', '-i', required=True, help='Input JSON file')
+    parser.add_argument('--output', '-o', required=True, help='Output DOCX file')
+    args = parser.parse_args()
 
-    catalog = load_catalog(args.table_catalog)
-    header_fill = catalog.pop("_header_fill", DEFAULT_HEADER_FILL)
+    with open(args.input, 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
-    data = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    doc = Document(args.template)
+    renderer = DocumentRenderer(args.template)
+    renderer.render(data, args.output)
 
-    # Insert a page break so generated content is visually separated from
-    # the template's existing sample content.
-    doc.add_page_break()
-
-    for section in data.get("sections", []):
-        render_section(doc, section, catalog, header_fill)
-
-    doc.save(args.output)
-    print(f"Wrote {args.output}")
+    print(f'Rendered {args.input} -> {args.output}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

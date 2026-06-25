@@ -12,10 +12,10 @@
 
 ```
 skills/docx-from-md/scripts/
-├── run_pipeline.py    ← 本 skill 自带，流水线编排脚本
-├── fix_md_tables.py   ← 本 skill 自带，表格预处理脚本
-├── md_to_json.py      ← 用户从 docx-deterministic-generator 产出复制过来
-└── render_docx.py     ← 用户从 docx-deterministic-generator 产出复制过来
+├── run_pipeline.py           ← 本 skill 自带，流水线编排脚本
+├── fix_md_tables.py          ← 本 skill 自带，表格预处理脚本
+├── md_to_json.py             ← 用户从 docx-deterministic-generator 产出复制过来
+└── render_docx.py            ← 用户从 docx-deterministic-generator 产出复制过来
 ```
 
 如果 `md_to_json.py` 或 `render_docx.py` 不存在，运行时会报错并提示：
@@ -41,8 +41,6 @@ Claude 会调用 `scripts/run_pipeline.py` 完成转换。
 python3 skills/docx-from-md/scripts/run_pipeline.py \
   --md 你的文档.md \
   --template 模板.docx \
-  --schema out/docx-template-analysis/content_contract.schema.json \
-  --table-catalog out/docx-template-analysis/table_catalog.json \
   --output generated.docx
 ```
 
@@ -52,8 +50,6 @@ python3 skills/docx-from-md/scripts/run_pipeline.py \
 |---|---|---|
 | `--md` | ✅ | 输入的 Markdown 文档（按模板章节格式编写） |
 | `--template` | ✅ | 原始 `.docx` 模板 |
-| `--schema` | ✅ | `content_contract.schema.json` 路径（模板分析产出） |
-| `--table-catalog` | ✅ | `table_catalog.json` 路径（模板分析产出） |
 | `--output` | ✅ | 输出 `.docx` 路径 |
 | `--keep-json` | ❌ | 保留中间 JSON 文件（默认生成后删除） |
 
@@ -80,8 +76,6 @@ docx-deterministic-generator        docx-from-md
 输入：模板.docx                      输入：文档.md + 模板.docx
 产出：render_docx.py                 产出：generated.docx
       md_to_json.py
-      table_catalog.json
-      content_contract.schema.json
       ...
 ```
 
@@ -98,4 +92,4 @@ docx-deterministic-generator        docx-from-md
 | 非矩形表格 | interface spec table 不同子段列数不一致 | 自动修复（`fix_md_tables.py`），无需手动处理 |
 | MD 格式错误 | 标题层级或表头不符合模板 | 修改 MD，使其符合模板章节格式 |
 | JSON 不符合 schema | MD 内容有缺失或格式错误 | 检查 `--keep-json` 输出的 JSON，对照 schema 修正 |
-| DOCX 生成失败 | 模板或 table_catalog 不匹配 | 确认 `--template` 和 `--table-catalog` 来自同一次模板分析 |
+| DOCX 生成失败 | 模板与脚本不匹配 | 确认 `--template` 和生成脚本的 `md_to_json.py`/`render_docx.py` 来自同一次模板分析 |
