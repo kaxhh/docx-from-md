@@ -74,6 +74,7 @@ TABLE_CONFIG = {
 HEADER_FILL = "D9D9D9"
 CELL_PARA_STYLE = "表格内文字"
 CAPTION_STYLE = "Caption"
+CAPTION_CHAR_STYLE = "题注 Char"
 BORDER_SZ = "4"
 ROW_HEIGHT_VAL = "270"
 CELL_MARGIN_LEFT = 108
@@ -275,6 +276,142 @@ def _write_cell_text(cell, text, style_name=CELL_PARA_STYLE):
             p = cell.add_paragraph()
         p.style = style_name if style_name else p.style
         run = p.add_run(line)
+
+
+def _make_seq_field_paragraph(doc, prefix, seq_label, caption_text,
+                               chapter_num="0", styleref_level=1):
+    """Build a caption paragraph with SEQ field (auto-numbering).
+
+    Produces XML like:
+      "图 " [STYLEREF <level> \\s] [-] [SEQ 图 \\* ARABIC \\s 1] " " caption_text
+
+    Args:
+        doc: Document object (needed for paragraph creation)
+        prefix: Caption prefix, e.g. "图" or "表"
+        seq_label: SEQ identifier, e.g. "图" or "表"
+        caption_text: The caption body text (after the number)
+        chapter_num: Chapter number placeholder (before field update)
+        styleref_level: Heading level for STYLEREF (e.g. 1 for "heading 1")
+
+    Returns:
+        The created paragraph element.
+    """
+    p = doc.add_paragraph()
+    p.style = CAPTION_STYLE
+    p_elem = p._element
+
+    # Try to resolve the 题注 Char character style from the template
+    char_style_id = None
+    try:
+        char_style = doc.styles[CAPTION_CHAR_STYLE]
+        char_style_id = char_style.style_id
+    except KeyError:
+        pass
+
+    def _rpr():
+        """Create standard run properties for SEQ field runs."""
+        rPr = OxmlElement('w:rPr')
+        if char_style_id:
+            rs = OxmlElement('w:rStyle')
+            rs.set(qn('w:val'), char_style_id)
+            rPr.append(rs)
+        b = OxmlElement('w:b')
+        u = OxmlElement('w:u')
+        u.set(qn('w:val'), 'none')
+        rPr.append(b)
+        rPr.append(u)
+        return rPr
+
+    def _run_with_text(text, east_asia=False):
+        """Add a run with text."""
+        r = OxmlElement('w:r')
+        r.append(_rpr())
+        t = OxmlElement('w:t')
+        t.set(qn('xml:space'), 'preserve')
+        t.text = text
+        r.append(t)
+        p_elem.append(r)
+
+    def _fldchar(ftype):
+        """Add a fldChar run."""
+        r = OxmlElement('w:r')
+        r.append(_rpr())
+        fc = OxmlElement('w:fldChar')
+        fc.set(qn('w:fldCharType'), ftype)
+        r.append(fc)
+        p_elem.append(r)
+
+    def _instr_text(text, east_asia=False):
+        """Add an instrText run."""
+        r = OxmlElement('w:r')
+        rPr = _rpr()
+        if east_asia:
+            rf = OxmlElement('w:rFonts')
+            rf.set(qn('w:hint'), 'eastAsia')
+            rPr.insert(0, rf)
+        r.append(rPr)
+        it = OxmlElement('w:instrText')
+        it.set(qn('xml:space'), 'preserve')
+        it.text = text
+        r.append(it)
+        p_elem.append(r)
+
+    # 1. Prefix text (e.g. "图 ")
+    _run_with_text(f'{prefix} ')
+
+    # 2. STYLEREF field: { STYLEREF <level> \s } -> chapter number
+    _fldchar('begin')
+    _instr_text(f' STYLEREF {styleref_level} \\s ')
+    _fldchar('separate')
+    _run_with_text(chapter_num)  # placeholder: shows chapter number when field not updated
+    _fldchar('end')
+
+    # 3. noBreakHyphen separator
+    r = OxmlElement('w:r')
+    r.append(_rpr())
+    nbh = OxmlElement('w:noBreakHyphen')
+    r.append(nbh)
+    p_elem.append(r)
+
+    # 4. SEQ field: { SEQ 图 \* ARABIC \s 1 } -> sequence number
+    _fldchar('begin')
+    _instr_text(f' SEQ ')
+    _instr_text(seq_label, east_asia=True)
+    _instr_text(f' \\* ARABIC \\s 1 ')
+    _fldchar('separate')
+    _run_with_text('0')  # placeholder
+    _fldchar('end')
+
+    # 5. Space + caption body text
+    _run_with_text(' ', east_asia=True)
+
+    # Caption body text (with east-Asia font hint)
+    r = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    rf = OxmlElement('w:rFonts')
+    rf.set(qn('w:hint'), 'eastAsia')
+    rf.set(qn('w:eastAsia'), '楷体')
+    rf.set(qn('w:cs'), '楷体')
+    rPr.append(rf)
+    kern = OxmlElement('w:kern')
+    kern.set(qn('w:val'), '2')
+    rPr.append(kern)
+    sz = OxmlElement('w:sz')
+    sz.set(qn('w:val'), '21')
+    rPr.append(sz)
+    szCs = OxmlElement('w:szCs')
+    szCs.set(qn('w:val'), '24')
+    rPr.append(szCs)
+    lang = OxmlElement('w:lang')
+    lang.set(qn('w:bidi'), 'ar')
+    rPr.append(lang)
+    r.append(rPr)
+    t = OxmlElement('w:t')
+    t.text = caption_text
+    r.append(t)
+    p_elem.append(r)
+
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -518,21 +655,62 @@ class DocxRenderer:
 
     def render(self, data, output_path):
         """Render JSON data to output .docx file."""
-        # Render document title (if needed, could be in cover page)
+        sections = data.get("sections", [])
+
+        # Detect minimum heading level for STYLEREF field in captions.
+        # e.g. if top-level is ##, min_level=2 → STYLEREF 2 \s
+        self._styleref_level = self._find_min_level(sections)
+
+        # Extract chapter number from the first top-level section title
+        # e.g., "4.7 分区文件系统" → chapter_num = "4"
+        self._chapter_num = "0"
+        for section in sections:
+            title = section.get("title", "")
+            match = re.match(r'^(\d+)', title)
+            if match:
+                self._chapter_num = match.group(1)
+                break
+
         # Render sections recursively
-        for section in data.get("sections", []):
+        for section in sections:
             self._render_section(section)
 
         self.doc.save(output_path)
+
+    @staticmethod
+    def _find_min_level(sections):
+        """Recursively find the minimum heading level in sections."""
+        if not sections:
+            return 99  # sentinel: empty list shouldn't affect parent
+        min_lv = 99
+        for s in sections:
+            lv = s.get("level", 1)
+            if lv < min_lv:
+                min_lv = lv
+            child_min = DocxRenderer._find_min_level(s.get("children", []))
+            if child_min < min_lv:
+                min_lv = child_min
+        return min_lv if min_lv <= 6 else 1
 
     def _render_section(self, section):
         """Render a section (heading + content + children)."""
         level = section.get("level", 1)
         title = section.get("title", "")
 
-        # Add heading
+        # Add heading with explicit outline level for TOC \u flag
         style_name = self.HEADING_STYLES.get(level, "Heading 1")
-        self.doc.add_heading(title, level=level)
+        heading_para = self.doc.add_heading(title, level=level)
+
+        # Set outline level on paragraph (required by TOC \u)
+        pPr = heading_para._element.find(qn('w:pPr'))
+        if pPr is None:
+            pPr = OxmlElement('w:pPr')
+            heading_para._element.insert(0, pPr)
+        outlineLvl = pPr.find(qn('w:outlineLvl'))
+        if outlineLvl is None:
+            outlineLvl = OxmlElement('w:outlineLvl')
+            pPr.append(outlineLvl)
+        outlineLvl.set(qn('w:val'), str(level - 1))
 
         # Add paragraphs
         for para in section.get("paragraphs", []):
@@ -560,8 +738,21 @@ class DocxRenderer:
         para_type = para.get("type", "text")
 
         if para_type == "caption":
-            p = self.doc.add_paragraph(text)
-            p.style = CAPTION_STYLE
+            # Detect caption kind and build SEQ field
+            if text.startswith("图"):
+                prefix, seq_label = "图", "图"
+                body = text[len("图"):].lstrip()
+            elif text.startswith("表"):
+                prefix, seq_label = "表", "表"
+                body = text[len("表"):].lstrip()
+            elif text.startswith("代码"):
+                prefix, seq_label = "代码", "代码"
+                body = text[len("代码"):].lstrip()
+            else:
+                prefix, seq_label, body = text[:1], text[:1], text[1:].lstrip()
+
+            _make_seq_field_paragraph(self.doc, prefix, seq_label, body,
+                                       self._chapter_num, self._styleref_level)
         elif para_type == "text":
             self.doc.add_paragraph(text)
 
@@ -609,10 +800,14 @@ class DocxRenderer:
         run = p.add_run(f"[Figure: {source}]")
         run.font.size = Pt(10)
 
-        # Add caption after figure
+        # Add caption with SEQ field
         if caption:
-            cp = self.doc.add_paragraph(caption)
-            cp.style = CAPTION_STYLE
+            if caption.startswith("图"):
+                body = caption[len("图"):].lstrip()
+            else:
+                body = caption
+            _make_seq_field_paragraph(self.doc, "图", "图", body,
+                                       self._chapter_num, self._styleref_level)
 
 
 # ---------------------------------------------------------------------------
