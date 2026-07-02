@@ -636,8 +636,9 @@ class DocxRenderer:
         6: "Heading 6",
     }
 
-    def __init__(self, template_path):
+    def __init__(self, template_path, base_dir="."):
         self.template_path = template_path
+        self.base_dir = base_dir
         self.doc = Document(template_path)
         self._prepare_template()
 
@@ -712,13 +713,13 @@ class DocxRenderer:
             pPr.append(outlineLvl)
         outlineLvl.set(qn('w:val'), str(level - 1))
 
+        # Add code blocks first (before paragraphs, so they don't land between caption and table)
+        for block in section.get("code_blocks", []):
+            self._render_code_block(block)
+
         # Add paragraphs
         for para in section.get("paragraphs", []):
             self._render_paragraph(para)
-
-        # Add code blocks
-        for block in section.get("code_blocks", []):
-            self._render_code_block(block)
 
         # Add tables
         for table_data in section.get("tables", []):
@@ -790,15 +791,57 @@ class DocxRenderer:
             render_simple_table(self.doc, table_data, config)
 
     def _render_figure(self, fig):
-        """Render a figure placeholder + caption."""
+        """Render a figure with embedded image (SVG auto-converted to PNG)."""
+        import os
+        import tempfile
+        import cairosvg
+
         source = fig.get("source", "")
         caption = fig.get("caption", "")
 
-        # Add figure placeholder paragraph
-        p = self.doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(f"[Figure: {source}]")
-        run.font.size = Pt(10)
+        # Resolve image path
+        img_path = os.path.join(self.base_dir, source) if self.base_dir else source
+
+        embedded = False
+        if os.path.isfile(img_path):
+            ext = os.path.splitext(img_path)[1].lower()
+            if ext == '.svg':
+                # Convert SVG to PNG and embed
+                try:
+                    # Read SVG and replace missing fonts
+                    with open(img_path, 'r', encoding='utf-8') as f:
+                        svg_content = f.read()
+                    # Replace SimSun (宋体) with Noto Sans CJK SC
+                    svg_content = svg_content.replace('SimSun', 'Noto Sans CJK SC')
+
+                    # Write patched SVG to temp file
+                    with tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8') as tmp_svg:
+                        tmp_svg.write(svg_content)
+                        tmp_svg_path = tmp_svg.name
+
+                    # Convert to PNG with higher DPI for better quality
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_png:
+                        cairosvg.svg2png(url=tmp_svg_path, write_to=tmp_png.name, dpi=150)
+                        self.doc.add_picture(tmp_png.name)
+                        embedded = True
+                        os.unlink(tmp_png.name)
+
+                    os.unlink(tmp_svg_path)
+                except Exception as e:
+                    print(f"⚠️  SVG 转换失败 {source}: {e}", file=sys.stderr)
+            else:
+                try:
+                    self.doc.add_picture(img_path)
+                    embedded = True
+                except Exception as e:
+                    print(f"⚠️  图片嵌入失败 {source}: {e}", file=sys.stderr)
+
+        if not embedded:
+            # Add placeholder
+            p = self.doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run(f"[Figure: {source}]")
+            run.font.size = Pt(10)
 
         # Add caption with SEQ field
         if caption:
@@ -818,12 +861,13 @@ def main():
     parser.add_argument("--template", required=True, help="Template .docx file")
     parser.add_argument("--input", required=True, help="Input JSON file")
     parser.add_argument("--output", required=True, help="Output .docx file")
+    parser.add_argument("--base-dir", default=".", help="Base directory for resolving relative image paths")
     args = parser.parse_args()
 
     with open(args.input, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    renderer = DocxRenderer(args.template)
+    renderer = DocxRenderer(args.template, args.base_dir)
     renderer.render(data, args.output)
 
     print(f"Generated: {args.output}")

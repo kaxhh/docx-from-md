@@ -104,6 +104,7 @@ def main() -> None:
                 "--template", str(args.template),
                 "--input", str(json_path),
                 "--output", str(args.output),
+                "--base-dir", str(args.md.parent),
             ],
         )
 

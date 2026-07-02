@@ -357,6 +357,14 @@ def convert_interface_spec_table(grid):
         texts = tuple(c.get("text", "").strip() for c in row[1:])
         return texts == meta.get("sub_header_texts")
 
+    def is_label_subheader_row(row, meta):
+        """Check if a label row also carries sub-header texts (rowspan=1 case)."""
+        sub_hdrs = meta.get("sub_header_texts")
+        if not sub_hdrs or len(row) < 1 + len(sub_hdrs):
+            return False
+        texts = tuple(c.get("text", "").strip() for c in row[1:1 + len(sub_hdrs)])
+        return texts == sub_hdrs
+
     def extract_row_data(row, sub_fields, start_col=1):
         """Extract data from a row using sub_fields for column mapping."""
         entry = {}
@@ -390,9 +398,16 @@ def convert_interface_spec_table(grid):
 
             elif meta["kind"] == "list":
                 i += 1  # move past label row
-                # Skip sub-header row if present
-                if i < len(grid) and is_subheader_row(grid[i], meta):
+                # Check if next row has rowspan continuation (rowspan > 1 case)
+                next_has_continuation = (
+                    i < len(grid) and grid[i] and
+                    grid[i][0].get("rowspan_continue", False)
+                )
+                # Skip sub-header row if present on separate row
+                if not next_has_continuation and i < len(grid) and is_subheader_row(grid[i], meta):
                     i += 1
+                # Data column offset: 0 for rowspan=1, 1 for rowspan>1
+                data_start_col = 0 if not next_has_continuation else 1
                 # Collect data rows until next label
                 while i < len(grid):
                     first = grid[i][0] if grid[i] else {}
@@ -407,7 +422,7 @@ def convert_interface_spec_table(grid):
                         i += 1
                         continue
                     # Extract data
-                    entry = extract_row_data(grid[i], meta["sub_fields"])
+                    entry = extract_row_data(grid[i], meta["sub_fields"], start_col=data_start_col)
                     if any(v for v in entry.values()):
                         result["rows"][meta["field"]].append(entry)
                     i += 1
